@@ -72,6 +72,9 @@ const MASKN = 256, BLK = 32;
 const WHEAT = 0, CORN = 1, SOY = 2, FALLOW = 3, GRASS = 4, WOOD = 5, BUILT = 6;
 const CROP_NAME = ['winter wheat','corn','soybeans','worked ground','grass','timber','the yard','the airstrip'];
 const YIELD = [0.019, 0.032, 0.013];        // bushels per 0.64 m^2 cell
+const PRICE = [5.5, 4.0, 6.5];              // $ per bushel: wheat, corn, soy
+const SHIRT_COLORS = [0xb5423a, 0x3b82f6, 0x22c55e, 0xeab308, 0xa855f7, 0xf97316, 0xec4899, 0x06b6d4];
+let shirtIndex = 0;
 
 let _seed = 20260907;
 const rnd = () => (_seed = (_seed*1664525 + 1013904223) >>> 0) / 4294967296;
@@ -313,9 +316,10 @@ function applyView(){
   scene.fog.far = Math.max(2600, VIEW*180);
 }
 function resize(){
+  if(!innerWidth || !innerHeight) return;
   renderer.setSize(innerWidth, innerHeight);
   const sz = renderer.getDrawingBufferSize(new THREE.Vector2());
-  rt.setSize(Math.floor(sz.x*SS), Math.floor(sz.y*SS));
+  rt.setSize(Math.max(1, Math.floor(sz.x*SS)), Math.max(1, Math.floor(sz.y*SS)));
   postUni.uTexel.value.set(1/rt.width, 1/rt.height);
   applyView();
 }
@@ -439,7 +443,7 @@ function writeTexel(cx, cy, v){
   const ix = cx - maskOrigin.x, iy = cy - maskOrigin.y;
   if(ix < 0 || iy < 0 || ix >= MASKN || iy >= MASKN) return;
   const o = (iy*MASKN + ix)*4;
-  maskData[o] = 255;
+  maskData[o] = v ? 255 : 0;
   maskData[o+1] = (v & 2) ? 255 : 0;
   maskData[o+2] = (v & 4) ? 255 : 0;
   maskDirty = true;
@@ -450,8 +454,14 @@ function setCell(cx, cy, v, local){
   let b = blocks.get(key);
   if(!b){ b = new Uint8Array(BLK*BLK); blocks.set(key, b); }
   const li = (((cy % BLK)+BLK)%BLK)*BLK + (((cx % BLK)+BLK)%BLK);
-  if(b[li]) return false;
-  b[li] = v; workedCells++;
+  const cur = b[li];
+  if(v){
+    if(cur) return false;
+    b[li] = v; workedCells++;
+  } else {
+    if(!cur) return false;
+    b[li] = 0; workedCells--;
+  }
   writeTexel(cx, cy, v);
   if(local) pendingWork.push(cx, cy, v);
   return true;
@@ -910,6 +920,47 @@ const painted = new THREE.MeshLambertMaterial({vertexColors:true});
 const GREEN = 0x2f7d32, DARK = 0x1e2a1c, YELLOW = 0xf2c230, GREY = 0x9aa0a6,
       RUBBER = 0x1b1b1d, RED = 0xb03a2e, STEEL = 0xc9cdd2;
 
+// ---------------------------------------------------------- building colliders
+const colliders = [];
+function addBoxCollider(x, z, hw, hd){ colliders.push({t:'box', x, z, hw, hd}); }
+function addCircleCollider(x, z, r){ colliders.push({t:'circle', x, z, r}); }
+function resolveCollisions(p, r){
+  let hit = false;
+  for(const c of colliders){
+    const dx = p.x - c.x, dz = p.z - c.z;
+    if(c.t === 'box'){
+      if(Math.abs(dx) - (c.hw + r + 1) > 0) continue;
+      if(Math.abs(dz) - (c.hd + r + 1) > 0) continue;
+      const cx = Math.max(-c.hw, Math.min(c.hw, dx));
+      const cz = Math.max(-c.hd, Math.min(c.hd, dz));
+      const ox = dx - cx, oz = dz - cz;
+      const d = Math.hypot(ox, oz);
+      if(d < r){
+        if(d > 0.001){
+          const nx = ox/d, nz = oz/d, push = r - d;
+          p.x += nx*push; p.z += nz*push; hit = true;
+        } else {
+          const ex = c.hw - Math.abs(dx), ez = c.hd - Math.abs(dz);
+          if(ex < ez){ p.x += Math.sign(dx) * (ex + r); }
+          else { p.z += Math.sign(dz) * (ez + r); }
+          hit = true;
+        }
+      }
+    } else {
+      const d = Math.hypot(dx, dz), min = r + c.r + 0.2;
+      if(d < min){
+        if(d > 0.001){
+          const nx = dx/d, nz = dz/d, push = min - d;
+          p.x += nx*push; p.z += nz*push; hit = true;
+        } else {
+          p.x += min; hit = true;
+        }
+      }
+    }
+  }
+  return hit;
+}
+
 // ------------------------------------------------------------- OSM scenery
 const dummy = new THREE.Object3D();
 {
@@ -926,10 +977,12 @@ const dummy = new THREE.Object3D();
     dummy.scale.set(b[2], h, b[3]); dummy.updateMatrix();
     wallMesh.setMatrixAt(i, dummy.matrix);
     const rl = Math.max(b[2],b[3]), rs = Math.min(b[2],b[3]);
-    dummy.position.set(b[0], h + rs*0.25, b[1]);
+    const ro = Math.max(0.3, rs*0.5 - 0.6);
+    dummy.position.set(b[0], h + ro*0.5, b[1]);
     dummy.rotation.set(0, b[2] >= b[3] ? 0 : Math.PI/2, Math.PI/2);
-    dummy.scale.set(rs*0.5, rl*1.02, rs*1.02); dummy.updateMatrix();
+    dummy.scale.set(ro, rl*1.02, rs*1.02); dummy.updateMatrix();
     roofMesh.setMatrixAt(i, dummy.matrix);
+    addBoxCollider(b[0], b[1], b[2]*0.5, b[3]*0.5);
   }
   wallMesh.frustumCulled = roofMesh.frustumCulled = false;
   scene.add(wallMesh, roofMesh);
@@ -945,11 +998,13 @@ const dummy = new THREE.Object3D();
     let sx = 0, sz = 0;
     for(let i = 0; i < p.length; i += 2){ sx += p[i]; sz += p[i+1]; }
     const cx = sx/(p.length/2), cz = sz/(p.length/2), k = 1 + Math.floor(rnd()*3);
+    if(Math.hypot(cx - BASE_XZ[0], cz - BASE_XZ[1]) < 2) continue;
     for(let i = 0; i < k; i++){
       const r = 3.6 + rnd()*1.2;
       dummy.position.set(cx + i*r*1.15 - k*r*0.4, 0, cz + (rnd()-0.5)*6);
       dummy.rotation.set(0,0,0); dummy.scale.set(r, 3.4 + rnd()*2.2, r);
       dummy.updateMatrix(); bins.setMatrixAt(n++, dummy.matrix);
+      addCircleCollider(dummy.position.x, dummy.position.z, r);
     }
   }
   bins.count = n; scene.add(bins);
@@ -1014,7 +1069,7 @@ const _unusedBase = (function(){
   g.position.set(BASE.x, 0, BASE.z);
   const shed = new THREE.Mesh(merge([
     {geo:new THREE.BoxGeometry(22,6,12), c:0xcfd3c8, m:T(0,3,0)},
-    {geo:ROOF, c:0x9c6b4f, m:TRS(0,7.4,0, 0, 2.8,22,12.6)},
+    {geo:ROOF, c:0x9c6b4f, m:TRS(0,7.1,0, 0, 2.2,22,12.6)},
     {geo:new THREE.BoxGeometry(6,5,0.4), c:0x53595a, m:T(-4,2.5,6.05)}
   ]), painted);
   shed.castShadow = shed.receiveShadow = true; g.add(shed);
@@ -1029,11 +1084,17 @@ const _unusedBase = (function(){
   }
   const house = new THREE.Mesh(merge([
     {geo:new THREE.BoxGeometry(12,6,10), c:0xe6e2d6, m:T(0,3,0)},
-    {geo:ROOF, c:0x7d4f43, m:TRS(0,7.2,0, 0, 2.4,12.4,10.6)}
+    {geo:ROOF, c:0x7d4f43, m:TRS(0,6.9,0, 0, 1.8,12.4,10.6)},
   ]), painted);
   house.position.set(30, 0, 14);
   house.castShadow = house.receiveShadow = true; g.add(house);
   scene.add(g);
+  addBoxCollider(BASE.x, BASE.z, 11, 6);
+  addBoxCollider(BASE.x + 30, BASE.z + 14, 6, 5);
+  for(let i = 0; i < 4; i++){
+    const r = 4.4 + (i%2)*0.9;
+    addCircleCollider(BASE.x - 26 + i*11.5, BASE.z - 19, r);
+  }
 }
 
 // ------------------------------------------------------------- the machines
@@ -1097,7 +1158,7 @@ function buildTractor(){
   return {kind:'tractor', name:'tractor', g:g, wheels:wheels, tool:tool, toolWidth:3.3,
           toolBack:-2.6, maxF:11, maxR:-5, accel:9, turn:0.13, canDrive:true,
           hitchZ:-2.9, grain:0, tank:0, heading:0, speed:0, steer:0, spin:0,
-          toolDown:true, radius:2.2, owner:null};
+          toolDown:false, planting:false, radius:2.2, owner:null};
 }
 function buildCombine(){
   const g = new THREE.Group(), parts = [], wheels = [];
@@ -1138,7 +1199,7 @@ function buildCombine(){
   return {kind:'combine', name:'combine', g:g, wheels:wheels, tool:tool, toolWidth:HW,
           toolBack:4.1, maxF:8, maxR:-4, accel:6, turn:0.16, canDrive:true,
           hitchZ:-4.2, grain:0, tank:350, heading:0, speed:0, steer:0, spin:0,
-          toolDown:true, radius:3.4, rearSteer:true, owner:null,
+          toolDown:true, radius:5.0, crop:-1, rearSteer:true, owner:null,
           // tip of the unloading auger, in the combine's own frame
           spout:[-4.6, 4.5, -2.0], auger:true};
 }
@@ -1163,10 +1224,39 @@ function buildCart(){
           maxF:0, maxR:0, accel:0, turn:0, canDrive:false, hitchZ:3.9, heap:heap,
           // the open hopper, in the cart's own frame: grain landing inside counts
           box:{hx:1.45, hz:2.7, top:3.05},
-          grain:0, tank:1000, heading:0, speed:0, steer:0, spin:0, radius:2.6, owner:null};
+          grain:0, tank:1000, crop:-1, heading:0, speed:0, steer:0, spin:0, radius:2.6, owner:null};
+}
+function buildPickup(){
+  const g = new THREE.Group(), parts = [], wheels = [];
+  const box = (w,h,d,c,x,y,z) => parts.push({geo:new THREE.BoxGeometry(w,h,d), c:c, m:T(x,y,z)});
+  box(2.0, 0.55, 4.6, RED, 0, 0.62, 0);
+  box(1.9, 0.42, 1.1, RED, 0, 1.15, 1.4);
+  box(1.85, 0.85, 1.5, RED, 0, 1.35, 0.35);
+  box(1.95, 0.55, 1.9, RED, 0, 0.95, -1.45);
+  box(2.0, 0.18, 0.25, DARK, 0, 0.45, 2.35);
+  box(2.0, 0.18, 0.25, DARK, 0, 0.45, -2.35);
+  box(0.26, 0.14, 0.12, YELLOW, -0.75, 0.75, 2.35);
+  box(0.26, 0.14, 0.12, YELLOW, 0.75, 0.75, 2.35);
+  box(0.18, 0.14, 0.10, RED, -0.85, 0.80, -2.35);
+  box(0.18, 0.14, 0.10, RED, 0.85, 0.80, -2.35);
+  const body = new THREE.Mesh(merge(parts), painted);
+  body.castShadow = true; g.add(body);
+  const glass = new THREE.Mesh(new THREE.BoxGeometry(1.75, 0.65, 1.55),
+    new THREE.MeshLambertMaterial({color:0xbfe3f5, transparent:true, opacity:0.5, depthWrite:false}));
+  glass.position.set(0, 1.55, 0.35); g.add(glass);
+  addWheels(g, wheels, [[-1.0, 1.5, 0.45, 0.42, STEEL, true],
+                       [1.0, 1.5, 0.45, 0.42, STEEL, true],
+                       [-1.0, -1.5, 0.45, 0.42, STEEL, false],
+                       [1.0, -1.5, 0.45, 0.42, STEEL, false]]);
+  scene.add(g);
+  return {kind:'pickup', name:'pickup', g:g, wheels:wheels, tool:null, toolWidth:0,
+          toolBack:0, maxF:22, maxR:-7, accel:13, turn:0.23, canDrive:true,
+          hitchZ:-2.2, grain:0, tank:0, heading:0, speed:0, steer:0, spin:0,
+          toolDown:false, radius:2.1, owner:null,
+          passengerSeat:new THREE.Vector3(0.4, 1.2, -1.5)};
 }
 function buildFarmer(){
-  const c = {skin:0xd9a878, shirt:0xb5423a, jeans:0x3c4a68, cap:0x2f4f2f, boot:0x4a3a2a};
+  const c = {skin:0xd9a878, shirt:SHIRT_COLORS[shirtIndex++ % SHIRT_COLORS.length], jeans:0x3c4a68, cap:0x2f4f2f, boot:0x4a3a2a};
   const m = new THREE.Mesh(merge([
     {geo:new THREE.BoxGeometry(0.30,0.42,0.24), c:c.jeans, m:T(-0.11,0.63,0)},
     {geo:new THREE.BoxGeometry(0.30,0.42,0.24), c:c.jeans, m:T(0.11,0.63,0)},
@@ -1221,13 +1311,15 @@ function buildPlane(){
   return {kind:'plane', name:'crop duster', g:g, wheels:wheels, prop:prop, disc:disc,
           tool:null, toolWidth:16, canDrive:true, hitchZ:-3.4, grain:0, tank:0,
           maxF:48, maxR:-3, accel:9, turn:0.11, heading:0, speed:0, steer:0, spin:0,
-          radius:4.2, owner:null, alt:0, climb:0, duster:false, airborne:false};
+          radius:4.2, owner:null, alt:0, climb:0, duster:false, airborne:false,
+          passengerSeat:new THREE.Vector3(2.2, 1.13, 0.5)};
 }
-const vehicles = [buildTractor(), buildCombine(), buildCart(), buildPlane()];
+const vehicles = [buildTractor(), buildCombine(), buildCart(), buildPlane(), buildPickup()];
 // lamp glows, so a lit machine reads as lit even when the beam falls outside view
 const LAMP_AT = [[[-0.5,1.55,1.92],[0.5,1.55,1.92]],
                  [[-0.85,3.05,2.45],[0.85,3.05,2.45]], [],
-                 [[-4.2,1.2,1.1],[4.2,1.2,1.1]]];
+                 [[-4.2,1.2,1.1],[4.2,1.2,1.1]],
+                 [[-0.85,0.85,2.4],[0.85,0.85,2.4]]];
 vehicles.forEach((v, i) => {
   v.lamps = LAMP_AT[i].map(p => {
     const m = new THREE.Mesh(new THREE.BoxGeometry(0.3, 0.22, 0.12),
@@ -1240,7 +1332,7 @@ vehicles.forEach((v, i) => {
   v.beamAt = LAMP_AT[i][0] ? [0, LAMP_AT[i][0][1], LAMP_AT[i][0][2]] : null;
 });
 vehicles[0].g.position.set(BASE.x - 16, 0, BASE.z + 8);
-vehicles[1].g.position.set(BASE.x + 2, 0, BASE.z + 10);
+vehicles[1].g.position.set(BASE.x - 25, 0, BASE.z + 13);
 vehicles[2].g.position.set(BASE.x + 20, 0, BASE.z - 2);
 vehicles.forEach(v => { v.heading = Math.PI; v.g.rotation.y = Math.PI; });
 { // park the duster at one end of the strip, lined up with it
@@ -1249,6 +1341,8 @@ vehicles.forEach(v => { v.heading = Math.PI; v.g.rotation.y = Math.PI; });
   pl.heading = Math.atan2(a.ax, a.az);
   pl.g.rotation.y = pl.heading;
 }
+// park the pickup in the yard
+vehicles[4].g.position.set(BASE.x + 12, 0, BASE.z + 18);
 
 const farmer = buildFarmer();
 farmer.position.set(BASE.x - 9, 0, BASE.z + 15);
@@ -1282,18 +1376,23 @@ scene.add(new THREE.Points(grainGeo, new THREE.PointsMaterial({
   color:0xe0b24a, size:4.0, sizeAttenuation:false, depthWrite:false})));
 const gvel = new Float32Array(MAXG*3);
 const glive = new Uint8Array(MAXG);
+const gcrop = new Int8Array(MAXG);
+for(let i = 0; i < MAXG; i++) gcrop[i] = -1;
 let gnext = 0, spilled = 0;
 
-function emitKernel(x, y, z, vx, vy, vz){
+function emitKernel(x, y, z, vx, vy, vz, crop = -1){
   gnext = (gnext + 1) % MAXG;
   const j = gnext;
   gpos[j*3] = x; gpos[j*3+1] = y; gpos[j*3+2] = z;
   gvel[j*3] = vx; gvel[j*3+1] = vy; gvel[j*3+2] = vz;
+  gcrop[j] = crop;
   glive[j] = 1;
 }
 // returns true if this kernel was caught
-function catchKernel(x, y, z){
+function catchKernel(j, x, y, z){
   const cart = vehicles[2];
+  const crop = gcrop[j];
+  if(crop < 0) return false;
   if(y > cart.box.top || y < cart.box.top - 2.2) return false;
   const dx = x - cart.g.position.x, dz = z - cart.g.position.z;
   const c = Math.cos(-cart.heading), sn = Math.sin(-cart.heading);
@@ -1302,6 +1401,8 @@ function catchKernel(x, y, z){
   // speed is a skill rather than a pixel-perfect alignment puzzle
   if(Math.abs(lx) > cart.box.hx + 0.7 || Math.abs(lz) > cart.box.hz + 0.7) return false;
   if(cart.grain >= cart.tank) return false;
+  if(cart.grain > 0 && cart.crop !== crop) return false;
+  if(cart.grain === 0) cart.crop = crop;
   cart.grain = Math.min(cart.tank, cart.grain + BU_PER_KERNEL);
   return true;
 }
@@ -1313,10 +1414,11 @@ function stepGrain(dt){
     const y = gpos[j*3+1] + gvel[j*3+1]*dt;
     const z = gpos[j*3+2] + gvel[j*3+2]*dt;
     gpos[j*3] = x; gpos[j*3+1] = y; gpos[j*3+2] = z;
-    if(gvel[j*3+1] < 0 && catchKernel(x, y, z)){ glive[j] = 0; gpos[j*3+1] = -50; continue; }
+    if(gvel[j*3+1] < 0 && catchKernel(j, x, y, z)){ glive[j] = 0; gpos[j*3+1] = -50; continue; }
     if(y <= 0.05){
       // into the pit at the yard, otherwise it is on the ground and lost
-      if(Math.hypot(x - (BASE.x - 9), z - (BASE.z - 19)) < 16) stored += BU_PER_KERNEL;
+      const crop = gcrop[j];
+      if(crop >= 0 && Math.hypot(x - (BASE.x - 9), z - (BASE.z - 19)) < 16) stored[crop] += BU_PER_KERNEL;
       else spilled += BU_PER_KERNEL;
       glive[j] = 0; gpos[j*3+1] = -50;
     }
@@ -1325,7 +1427,7 @@ function stepGrain(dt){
 }
 let augerAcc = 0;
 function runAuger(v, dt){
-  if(!v.spout || !v.auger || v.grain <= 0) return;
+  if(!v.spout || !v.auger || v.crop < 0 || v.grain <= 0) return;
   augerAcc += dt*22;                       // kernels per second
   const n = Math.floor(augerAcc);
   if(n <= 0) return;
@@ -1335,14 +1437,17 @@ function runAuger(v, dt){
   const wx = v.g.position.x + sx*c + sz*sn;
   const wz = v.g.position.z - sx*sn + sz*c;
   const fwd = v.speed;
+  const crop = v.crop;
   for(let i = 0; i < n && v.grain > 0; i++){
     v.grain = Math.max(0, v.grain - BU_PER_KERNEL);
+    if(v.grain < 0.001) v.crop = -1;
     const ox = (Math.random()-0.5)*0.5, oz = (Math.random()-0.5)*0.5;
     // thrown out along the auger, and carried by whatever the combine is doing
     emitKernel(wx + ox, sy, wz + oz,
       -1.5*c + Math.sin(v.heading)*fwd + (Math.random()-0.5)*0.5,
       -0.6,
-       1.5*sn + Math.cos(v.heading)*fwd + (Math.random()-0.5)*0.5);
+       1.5*sn + Math.cos(v.heading)*fwd + (Math.random()-0.5)*0.5,
+      crop);
   }
 }
 
@@ -1387,7 +1492,10 @@ function mist(x, y, z, vx, vz){
 const net = {peer:null, conns:[], host:false, id:null, on:false};
 const remotes = new Map();
 const mplog = t => { $('mplog').textContent = t; };
-let driving = -1, towedBy = -1, stored = 0;
+let driving = -1, riding = -1, stored = [0, 0, 0], cash = 0;
+const towedBy = new Int8Array(vehicles.length);
+for(let i = 0; i < towedBy.length; i++) towedBy[i] = -1;
+const rideTmp = new THREE.Vector3();
 
 function netSend(obj, except){
   if(!net.on) return;
@@ -1428,19 +1536,41 @@ function handle(msg, conn){
     if(!r){
       const m = buildFarmer();
       scene.add(m);
-      r = {mesh:m, x:msg.p[0], z:msg.p[1], h:msg.h};
+      r = {mesh:m, x:msg.p[0], z:msg.p[1], h:msg.h, riding:-1};
       remotes.set(msg.id, r);
       $('peers').textContent = (remotes.size + 1) + ' players';
     }
+    const oldRiding = r.riding;
+    r.riding = msg.r != null ? msg.r : -1;
     r.tx = msg.p[0]; r.tz = msg.p[1]; r.th = msg.h; r.veh = msg.v;
     if(msg.v >= 0 && msg.v !== driving){
       const v = vehicles[msg.v];
       v.g.position.set(msg.p[0], 0, msg.p[1]);
       v.heading = msg.h; v.g.rotation.y = msg.h;
     }
+    if(r.riding >= 0){
+      const v = vehicles[r.riding];
+      if(oldRiding !== r.riding){
+        v.g.attach(r.mesh);
+        r.mesh.position.copy(v.passengerSeat);
+        r.mesh.rotation.set(0, 0, 0);
+      }
+    } else if(oldRiding !== r.riding && oldRiding >= 0){
+      r.mesh.getWorldPosition(rideTmp);
+      scene.attach(r.mesh);
+      r.mesh.position.copy(rideTmp);
+      r.mesh.position.y = 0;
+      r.mesh.rotation.y = r.th;
+    }
     // the driver is the one moving grain about, so take their word for it
     if(msg.g && driving < 0){
-      vehicles[1].grain = msg.g[0]; vehicles[2].grain = msg.g[1]; stored = msg.g[2];
+      vehicles[1].grain = msg.g[0]; vehicles[2].grain = msg.g[1];
+      if(msg.g[2] != null){
+        if(Array.isArray(msg.g[2])) stored = msg.g[2];
+        else stored = [msg.g[2], 0, 0];
+      }
+      vehicles[1].crop = msg.g[3] != null ? msg.g[3] : -1;
+      vehicles[2].crop = msg.g[4] != null ? msg.g[4] : -1;
     }
     if(net.host) netSend(msg, conn);
   }
@@ -1503,8 +1633,10 @@ function nearestVehicle(x, z, maxD){
   return best;
 }
 function mount(i){
+  if(riding >= 0) dismountRide();
   const v = vehicles[i];
   if(v.owner && v.owner !== net.id) return;
+  if(towedBy[i] >= 0) return;
   driving = i;
   v.owner = net.id || 'me';
   farmer.visible = false;
@@ -1523,11 +1655,42 @@ function dismount(forced){
   if(!forced){ v.owner = null; netSend({t:'claim', v:driving, id:null}); }
   driving = -1;
 }
+function dismountRide(){
+  if(riding < 0) return;
+  farmer.getWorldPosition(rideTmp);
+  scene.attach(farmer);
+  farmer.position.copy(rideTmp);
+  farmer.position.y = 0;
+  farmer.rotation.set(0, 0, 0);
+  riding = -1;
+}
+function ride(i){
+  if(driving >= 0){ dismount(false); if(driving >= 0) return; }
+  const v = vehicles[i];
+  if(!v.passengerSeat) return;
+  if(riding === i){ dismountRide(); return; }
+  if(riding >= 0) dismountRide();
+  riding = i;
+  v.g.attach(farmer);
+  farmer.position.copy(v.passengerSeat);
+  farmer.rotation.set(0, 0, 0);
+  farmer.visible = true;
+}
 function unload(){
   if(driving < 0) return;
   const v = vehicles[driving];
   if(v.kind === 'plane') v.duster = !v.duster;
   else if(v.spout) v.auger = !v.auger;
+}
+function sell(){
+  const p = driving >= 0 ? vehicles[driving].g.position : farmer.position;
+  const binX = BASE.x - 9, binZ = BASE.z - 19;
+  if(Math.hypot(p.x - binX, p.z - binZ) > 25) return;
+  let sold = 0;
+  for(let i = 0; i < 3; i++){
+    if(stored[i] >= 1){ cash += stored[i] * PRICE[i]; sold += stored[i]; stored[i] = 0; }
+  }
+  if(sold < 1) return;
 }
 addEventListener('keydown', e => {
   if(e.target.tagName === 'INPUT') return;
@@ -1540,11 +1703,29 @@ addEventListener('keydown', e => {
   if(k === 'p' && driving >= 0 && vehicles[driving].tool)
     vehicles[driving].toolDown = !vehicles[driving].toolDown;
   if(k === 'h' && driving >= 0){
-    const cart = vehicles[2], v = vehicles[driving];
-    if(towedBy === driving) towedBy = -1;
-    else if(Math.hypot(cart.g.position.x - v.g.position.x,
-                       cart.g.position.z - v.g.position.z) < 16) towedBy = driving;
+    const v = vehicles[driving];
+    let best = -1, bd = 16;
+    for(let i = 0; i < vehicles.length; i++){
+      if(i === driving) continue;
+      const d = Math.hypot(vehicles[i].g.position.x - v.g.position.x,
+                           vehicles[i].g.position.z - v.g.position.z);
+      if(d < bd){ bd = d; best = i; }
+    }
+    if(best >= 0){
+      if(towedBy[best] === driving) towedBy[best] = -1;
+      else {
+        for(let i = 0; i < vehicles.length; i++) if(towedBy[i] === driving) towedBy[i] = -1;
+        towedBy[best] = driving;
+      }
+    }
   }
+  if(k === 'j' && driving >= 0 && vehicles[driving].kind === 'tractor')
+    vehicles[driving].planting = !vehicles[driving].planting;
+  if(k === 'r' && driving < 0){
+    if(riding >= 0) dismountRide();
+    else { const i = nearestVehicle(farmer.position.x, farmer.position.z, 7); if(i >= 0) ride(i); }
+  }
+  if(k === 'm') sell();
   if(k === 'u') unload();
   if(k === 'l') lampsForced = !lampsForced;
   if(k === ',') tod = (tod + 23) % 24;
@@ -1560,6 +1741,7 @@ function workSwath(v){
   if(!v.tool || !v.toolDown || Math.abs(v.speed) < 0.4) return;
   const cs = Math.cos(v.heading), sn = Math.sin(v.heading);
   const harvest = v.kind === 'combine';
+  const plant = v.kind === 'tractor' && v.planting;
   const flag = 1 | (Math.abs(sn) > Math.abs(cs) ? 2 : 0) | (harvest ? 4 : 0);
   const hw = v.toolWidth/2, steps = Math.ceil(v.toolWidth/CELL) + 1;
   let got = 0;
@@ -1571,13 +1753,25 @@ function workSwath(v){
       const wz = v.g.position.z - off*sn + back*cs;
       const code = fieldCodeAt(wx, wz);
       if(harvest && code > SOY) continue;
-      if(setCell(Math.floor(wx/CELL), Math.floor(wz/CELL), flag, true) && harvest)
-        got += YIELD[code];
+      if(plant){
+        if(code > SOY) continue;
+        if(setCell(Math.floor(wx/CELL), Math.floor(wz/CELL), 0, true)) got++;
+      } else if(harvest){
+        if(v.grain > 0 && v.crop !== code) continue;
+        if(setCell(Math.floor(wx/CELL), Math.floor(wz/CELL), flag, true)){
+          if(v.grain === 0) v.crop = code;
+          got += YIELD[code];
+        }
+      } else {
+        setCell(Math.floor(wx/CELL), Math.floor(wz/CELL), flag, true);
+      }
     }
   }
   if(harvest){
     if(got > 0) v.grain = Math.min(v.tank, v.grain + got);
     puff(v.g.position.x + 1.5*sn, v.g.position.z + 1.5*cs, 3.6);
+  } else if(plant && got > 0){
+    puff(v.g.position.x - 3*sn, v.g.position.z - 3*cs, 2.0);
   } else puff(v.g.position.x - 3*sn, v.g.position.z - 3*cs, 3.2);
 }
 
@@ -1602,12 +1796,12 @@ for(let y = 0; y < 190; y++) for(let x = 0; x < 190; x++){
 // -------------------------------------------------------------------- loop
 const tmp = new THREE.Vector3();
 const fpsEl = $('fps'), dcEl = $('dc');
-let last = performance.now(), shadowTick = 0, fpsT = 0, fpsN = 0, netT = 0, workT = 0;
+let last = performance.now(), fpsT = 0, fpsN = 0, netT = 0, workT = 0;
 let lastCalls = 0, lastTris = 0;
 $('helpbtn').onclick = () => { $('help').hidden = !$('help').hidden; };
 $('ctl').innerHTML =
   '<kbd>W</kbd><kbd>A</kbd><kbd>S</kbd><kbd>D</kbd> drive / walk &middot; <kbd>F</kbd> get in / out<br>' +
-  '<kbd>P</kbd> tool up/down &middot; <kbd>H</kbd> hitch cart &middot; <kbd>U</kbd> auger / duster &middot; <kbd>L</kbd> lamps<br><kbd>,</kbd><kbd>.</kbd> time of day<br>' +
+  '<kbd>P</kbd> tool up/down &middot; <kbd>J</kbd> plow/plant (tractor) &middot; <kbd>H</kbd> hitch tow &middot; <kbd>R</kbd> ride &middot; <kbd>M</kbd> sell at bins &middot; <kbd>U</kbd> auger / duster &middot; <kbd>L</kbd> lamps<br><kbd>,</kbd><kbd>.</kbd> time of day<br>' +
   '<kbd>Q</kbd><kbd>E</kbd> rotate &middot; <kbd>wheel</kbd> / <kbd>[</kbd><kbd>]</kbd> zoom &middot; ' +
   '<kbd>Space</kbd> brake &middot; <kbd>Shift</kbd> climb';
 
@@ -1626,6 +1820,7 @@ function driveVehicle(v, dt){
   v.g.rotation.y = v.heading;
   v.g.position.x = Math.max(-HALF, Math.min(HALF, v.g.position.x + Math.sin(v.heading)*v.speed*dt));
   v.g.position.z = Math.max(-HALF, Math.min(HALF, v.g.position.z + Math.cos(v.heading)*v.speed*dt));
+  if(resolveCollisions(v.g.position, v.radius)) v.speed *= 0.2;
   v.spin += v.speed*dt;
   for(const w of v.wheels){
     w.m.rotation.x = -v.spin/w.R;
@@ -1660,6 +1855,7 @@ function flyPlane(v, dt){
 
   v.g.position.x = Math.max(-HALF, Math.min(HALF, v.g.position.x + Math.sin(v.heading)*v.speed*dt));
   v.g.position.z = Math.max(-HALF, Math.min(HALF, v.g.position.z + Math.cos(v.heading)*v.speed*dt));
+  if(!v.airborne && resolveCollisions(v.g.position, v.radius)) v.speed *= 0.2;
   v.g.position.y = v.alt;
   v.g.rotation.set(THREE.MathUtils.clamp(-v.climb*0.035, -0.3, 0.3),
                    v.heading, -v.steer*0.55*(v.airborne ? 1 : 0.15), 'YXZ');
@@ -1689,7 +1885,7 @@ function frame(now){
     if(v.kind === 'plane') flyPlane(v, dt);
     else { driveVehicle(v, dt); workSwath(v); runAuger(v, dt); }
     farmer.position.set(v.g.position.x, 0, v.g.position.z);
-  } else {
+  } else if(riding < 0){
     let mx = 0, mz = 0;
     if(keys['w'] || keys['arrowup']) mz -= 1;
     if(keys['s'] || keys['arrowdown']) mz += 1;
@@ -1702,6 +1898,7 @@ function frame(now){
       const wx = (mx*ca + mz*sa)/len, wz = (-mx*sa + mz*ca)/len;
       farmer.position.x = Math.max(-HALF, Math.min(HALF, farmer.position.x + wx*sp));
       farmer.position.z = Math.max(-HALF, Math.min(HALF, farmer.position.z + wz*sp));
+      resolveCollisions(farmer.position, 0.5);
       farmerHeading = Math.atan2(wx, wz);
       walkPhase += sp*3.4;
     }
@@ -1709,24 +1906,27 @@ function frame(now){
     farmer.position.y = Math.abs(Math.sin(walkPhase))*0.045;
   }
 
-  // the cart trails its hitch like a real trailer
+  // towed vehicles trail their hitch like a real trailer
   const cart = vehicles[2];
-  if(towedBy >= 0 && towedBy !== 2){
-    const tv = vehicles[towedBy];
+  for(let j = 0; j < vehicles.length; j++){
+    const i = towedBy[j];
+    if(i < 0 || j === i || j === driving) continue;
+    const tv = vehicles[i], v = vehicles[j];
     const hx = tv.g.position.x + Math.sin(tv.heading)*tv.hitchZ;
     const hz = tv.g.position.z + Math.cos(tv.heading)*tv.hitchZ;
-    let dx = cart.g.position.x - hx, dz = cart.g.position.z - hz;
+    let dx = v.g.position.x - hx, dz = v.g.position.z - hz;
     const d = Math.hypot(dx, dz) || 1e-3;
-    const L = 5.2;
-    cart.heading = Math.atan2(dx/d, dz/d);
-    cart.g.rotation.y = cart.heading;
-    cart.g.position.x = hx + dx/d*L;
-    cart.g.position.z = hz + dz/d*L;
-    cart.spin += tv.speed*dt;
-    for(const w of cart.wheels) w.m.rotation.x = -cart.spin/w.R;
+    const L = Math.max(5.0, v.radius + 2.0);
+    v.heading = Math.atan2(dx/d, dz/d);
+    v.g.rotation.y = v.heading;
+    v.g.position.x = hx + dx/d*L;
+    v.g.position.z = hz + dz/d*L;
+    resolveCollisions(v.g.position, v.radius);
+    v.spin += tv.speed*dt;
+    for(const w of v.wheels) w.m.rotation.x = -v.spin/w.R;
   }
 
-  const active = driving >= 0 ? vehicles[driving].g.position : farmer.position;
+  const active = driving >= 0 ? vehicles[driving].g.position : (riding >= 0 ? vehicles[riding].g.position : farmer.position);
   uFocus.value.set(active.x, active.z);
   // roughly how far the ground reaches at this zoom, capped by the live window
   uGrowEdge.value = 150;    // the plant fade below retires them long before this
@@ -1762,10 +1962,12 @@ function frame(now){
   sprayGeo.attributes.position.needsUpdate = true;
   stepGrain(dt);
   // a full cart parked at the yard augers itself into the bins
-  if(cart.grain > 0 && Math.hypot(cart.g.position.x - (BASE.x - 9),
+  if(cart.grain > 0 && cart.crop >= 0 && Math.hypot(cart.g.position.x - (BASE.x - 9),
                                   cart.g.position.z - (BASE.z - 19)) < 18){
     const moved = Math.min(cart.grain, 45*dt);
-    cart.grain -= moved; stored += moved;
+    cart.grain -= moved;
+    stored[cart.crop] += moved;
+    if(cart.grain <= 0.001) cart.crop = -1;
   }
   const fill = cart.grain/cart.tank;
   cart.heap.visible = fill > 0.005;
@@ -1786,8 +1988,8 @@ function frame(now){
   camera.position.lerp(tmp, Math.min(1, 6*dt));
   camera.lookAt(active.x, active.y + 1, active.z);   // follows the plane up
   const sky = updateSky(dt);
-  sun.position.set(active.x + sky.dir.x*70, sky.dir.y*70 + 4, active.z + sky.dir.z*70);
-  sun.target.position.set(active.x, 0, active.z);
+  sun.position.set(active.x + sky.dir.x*70, active.y + sky.dir.y*70 + 4, active.z + sky.dir.z*70);
+  sun.target.position.set(active.x, active.y + 1, active.z);
   sun.target.updateMatrixWorld();
 
   // lamps come on at dusk, or whenever the driver insists
@@ -1810,7 +2012,7 @@ function frame(now){
     beams[i].target.updateMatrixWorld();
   }
   for(const v of vehicles) for(const m of v.lamps) m.visible = lampsOn;
-  if(near && ++shadowTick % 2 === 0) renderer.shadowMap.needsUpdate = true;
+  renderer.shadowMap.needsUpdate = true;
 
   for(const [, r] of remotes){
     r.x += (r.tx - r.x)*Math.min(1, 10*dt);
@@ -1819,16 +2021,19 @@ function frame(now){
     while(dh > Math.PI) dh -= 2*Math.PI;
     while(dh < -Math.PI) dh += 2*Math.PI;
     r.h += dh*Math.min(1, 10*dt);
-    r.mesh.position.set(r.x, 0, r.z);
-    r.mesh.rotation.y = r.h;
+    if(r.riding < 0){
+      r.mesh.position.set(r.x, 0, r.z);
+      r.mesh.rotation.y = r.h;
+    }
     r.mesh.visible = !(r.veh >= 0);
   }
 
   if(net.on && now - netT > 66){
     netT = now;
     netSend({t:'state', id:net.id, p:[active.x, active.z],
-             h: driving >= 0 ? vehicles[driving].heading : farmerHeading, v:driving,
-             g: driving >= 0 ? [vehicles[1].grain, vehicles[2].grain, stored] : null});
+             h: driving >= 0 ? vehicles[driving].heading : (riding >= 0 ? vehicles[riding].heading : farmerHeading), v:driving,
+             r: riding,
+             g: driving >= 0 ? [vehicles[1].grain, vehicles[2].grain, stored, vehicles[1].crop, vehicles[2].crop] : null});
   }
   if(pendingWork.length && now - workT > 220){
     workT = now;
@@ -1859,7 +2064,7 @@ function frame(now){
     fpsT = now; fpsN = 0;
     const v = driving >= 0 ? vehicles[driving] : null;
     $('line1').textContent = (v ? 'Driving the ' + v.name + ' · ' +
-      Math.abs(v.speed*3.6).toFixed(0) + ' km/h · tool ' + (v.toolDown ? 'DOWN' : 'UP')
+      Math.abs(v.speed*3.6).toFixed(0) + ' km/h · ' + (v.kind === 'tractor' ? (v.planting ? 'PLANT' : 'PLOW') : 'tool') + ' ' + (v.toolDown ? 'DOWN' : 'UP')
       : 'On foot — F to get in') + ' · ' + CROP_NAME[fieldCodeAt(active.x, active.z)] +
       ' · ' + String(Math.floor(tod)).padStart(2,'0') + ':' +
       String(Math.floor((tod%1)*60)).padStart(2,'0');
@@ -1868,9 +2073,12 @@ function frame(now){
         Math.abs(v.speed*3.6).toFixed(0) + ' km/h - ' + v.alt.toFixed(0) + ' m - duster ' +
         (v.duster ? 'ON' : 'off');
     $('line2').textContent = 'Worked ' + (workedCells*CELL*CELL/10000).toFixed(2) + ' ha · combine ' +
-      vehicles[1].grain.toFixed(0) + '/' + vehicles[1].tank + ' bu (auger ' +
+      vehicles[1].grain.toFixed(0) + '/' + vehicles[1].tank + ' bu ' +
+      (vehicles[1].crop >= 0 ? CROP_NAME[vehicles[1].crop] : 'empty') + ' (auger ' +
       (vehicles[1].auger ? 'on' : 'off') + ') · cart ' + vehicles[2].grain.toFixed(0) + '/' +
-      vehicles[2].tank + ' bu · bins ' + stored.toFixed(0) + ' bu' +
+      vehicles[2].tank + ' bu ' + (vehicles[2].crop >= 0 ? CROP_NAME[vehicles[2].crop] : 'empty') +
+      ' · bins W:' + stored[0].toFixed(0) + ' C:' + stored[1].toFixed(0) + ' S:' + stored[2].toFixed(0) +
+      ' bu · cash $' + cash.toFixed(0) +
       (dusted > 0.01 ? ' · dusted ' + dusted.toFixed(1) + ' ha' : '') +
       (spilled > 1 ? ' · spilled ' + spilled.toFixed(0) : '');
     mg.putImageData(miniImg, 0, 0);
